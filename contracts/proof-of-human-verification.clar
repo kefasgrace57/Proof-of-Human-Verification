@@ -9,10 +9,16 @@
 (define-constant err-insufficient-vouches (err u107))
 (define-constant err-invalid-challenge (err u108))
 (define-constant err-challenge-expired (err u109))
+(define-constant err-insufficient-reputation (err u112))
 
-(define-constant min-stake u1000000)
+(define-constant minimum-stake u1000000)
 (define-constant required-vouches u3)
 (define-constant challenge-duration u144)
+(define-constant base-reputation-score u500)
+(define-constant max-reputation-score u1000)
+(define-constant vouch-reward u50)
+(define-constant challenge-success-reward u30)
+(define-constant challenge-fail-penalty u20)
 
 (define-data-var contract-paused bool false)
 (define-data-var total-verified uint u0)
@@ -51,6 +57,17 @@
   { verified-at: uint }
 )
 
+(define-map reputation-scores
+  { user: principal }
+  {
+    current-score: uint,
+    total-vouches-given: uint,
+    successful-challenges: uint,
+    failed-challenges: uint,
+    last-activity: uint
+  }
+)
+
 (define-read-only (get-user-info (user principal))
   (map-get? user-registrations { user: user })
 )
@@ -78,21 +95,79 @@
   (var-get contract-paused)
 )
 
+(define-read-only (get-reputation-score (user principal))
+  (default-to 
+    {
+      current-score: base-reputation-score,
+      total-vouches-given: u0,
+      successful-challenges: u0,
+      failed-challenges: u0,
+      last-activity: u0
+    }
+    (map-get? reputation-scores { user: user })
+  )
+)
+
+(define-read-only (calculate-trust-level (user principal))
+  (let (
+    (reputation (get-reputation-score user))
+    (score (get current-score reputation))
+  )
+    (if (>= score u800)
+      "high"
+      (if (>= score u600)
+        "medium"
+        "low"
+      )
+    )
+  )
+)
+
+(define-private (update-reputation-score (user principal) (score-change int))
+  (let (
+    (current-reputation (get-reputation-score user))
+    (current-score (get current-score current-reputation))
+    (new-score 
+      (if (< score-change 0)
+        (if (> current-score (to-uint (- 0 score-change)))
+          (- current-score (to-uint (- 0 score-change)))
+          u0
+        )
+        (if (> (+ current-score (to-uint score-change)) max-reputation-score)
+          max-reputation-score
+          (+ current-score (to-uint score-change))
+        )
+      )
+    )
+  )
+    (map-set reputation-scores
+      { user: user }
+      (merge current-reputation 
+        { 
+          current-score: new-score,
+          last-activity: stacks-block-height
+        }
+      )
+    )
+    (ok new-score)
+  )
+)
+
 (define-public (register-human (proof-hash (buff 32)))
   (let (
     (user tx-sender)
     (stake-amount (stx-get-balance tx-sender))
   )
     (asserts! (not (var-get contract-paused)) (err u110))
-    (asserts! (>= stake-amount min-stake) err-insufficient-stake)
+    (asserts! (>= stake-amount minimum-stake) err-insufficient-stake)
     (asserts! (is-none (map-get? user-registrations { user: user })) err-already-exists)
     
-    (try! (stx-transfer? min-stake tx-sender (as-contract tx-sender)))
+    (try! (stx-transfer? minimum-stake tx-sender (as-contract tx-sender)))
     
     (map-set user-registrations
       { user: user }
       {
-        stake-amount: min-stake,
+        stake-amount: minimum-stake,
         registration-height: stacks-block-height,
         verification-status: "pending",
         vouches-received: u0,
@@ -141,11 +216,16 @@
             { verified-at: stacks-block-height }
           )
           (var-set total-verified (+ (var-get total-verified) u1))
+          (unwrap-panic (update-reputation-score target (to-int base-reputation-score)))
         )
-        (map-set user-registrations { user: target } updated-target-info)
+        (begin
+          (map-set user-registrations { user: target } updated-target-info)
+          u0
+        )
       )
     )
     
+    (unwrap-panic (update-reputation-score voucher (to-int vouch-reward)))
     (ok true)
   )
 )
@@ -301,5 +381,60 @@
     (try! (as-contract (stx-transfer? stake-amount tx-sender user)))
     (map-delete user-registrations { user: user })
     (ok stake-amount)
+  )
+)
+
+(define-public (update-challenge-stats (target principal) (success bool))
+  (let (
+    (challenger tx-sender)
+    (challenger-info (unwrap! (map-get? user-registrations { user: challenger }) err-not-found))
+    (current-reputation (get-reputation-score challenger))
+    (score-change (if success challenge-success-reward challenge-fail-penalty))
+  )
+    (asserts! (not (var-get contract-paused)) (err u110))
+    (asserts! (is-eq (get verification-status challenger-info) "verified") err-not-verified)
+    
+    (if success
+      (map-set reputation-scores
+        { user: challenger }
+        (merge current-reputation { successful-challenges: (+ (get successful-challenges current-reputation) u1) })
+      )
+      (map-set reputation-scores
+        { user: challenger }
+        (merge current-reputation { failed-challenges: (+ (get failed-challenges current-reputation) u1) })
+      )
+    )
+    
+    (unwrap-panic (update-reputation-score challenger (to-int score-change)))
+    (ok true)
+  )
+)
+
+(define-public (verify-high-reputation-user (target principal))
+  (let (
+    (verifier tx-sender)
+    (verifier-info (unwrap! (map-get? user-registrations { user: verifier }) err-not-found))
+    (target-info (unwrap! (map-get? user-registrations { user: target }) err-not-found))
+    (verifier-trust (calculate-trust-level verifier))
+  )
+    (asserts! (not (var-get contract-paused)) (err u110))
+    (asserts! (is-eq (get verification-status verifier-info) "verified") err-not-verified)
+    (asserts! (is-eq verifier-trust "high") err-insufficient-reputation)
+    (asserts! (is-eq (get verification-status target-info) "pending") err-not-found)
+    
+    (map-set user-registrations
+      { user: target }
+      (merge target-info { verification-status: "verified" })
+    )
+    
+    (map-set verification-timestamps
+      { user: target }
+      { verified-at: stacks-block-height }
+    )
+    
+    (var-set total-verified (+ (var-get total-verified) u1))
+    (unwrap-panic (update-reputation-score target (to-int base-reputation-score)))
+    (unwrap-panic (update-reputation-score verifier (to-int (* vouch-reward u2))))
+    (ok true)
   )
 )
