@@ -10,6 +10,8 @@
 (define-constant err-invalid-challenge (err u108))
 (define-constant err-challenge-expired (err u109))
 (define-constant err-insufficient-reputation (err u112))
+(define-constant err-verification-expired (err u113))
+(define-constant err-too-early-renewal (err u114))
 
 (define-constant minimum-stake u1000000)
 (define-constant required-vouches u3)
@@ -19,6 +21,9 @@
 (define-constant vouch-reward u50)
 (define-constant challenge-success-reward u30)
 (define-constant challenge-fail-penalty u20)
+(define-constant verification-validity-period u8640)
+(define-constant renewal-window u1440)
+(define-constant renewal-discount-rate u2)
 
 (define-data-var contract-paused bool false)
 (define-data-var total-verified uint u0)
@@ -74,7 +79,53 @@
 
 (define-read-only (is-verified (user principal))
   (match (map-get? user-registrations { user: user })
-    user-data (is-eq (get verification-status user-data) "verified")
+    user-data 
+      (and 
+        (is-eq (get verification-status user-data) "verified")
+        (is-verification-valid user)
+      )
+    false
+  )
+)
+
+(define-read-only (is-verification-valid (user principal))
+  (match (map-get? verification-timestamps { user: user })
+    timestamp-data
+      (let (
+        (verified-at (get verified-at timestamp-data))
+        (expiry-height (+ verified-at verification-validity-period))
+      )
+        (< stacks-block-height expiry-height)
+      )
+    false
+  )
+)
+
+(define-read-only (get-verification-expiry (user principal))
+  (match (map-get? verification-timestamps { user: user })
+    timestamp-data
+      (let (
+        (verified-at (get verified-at timestamp-data))
+      )
+        (some (+ verified-at verification-validity-period))
+      )
+    none
+  )
+)
+
+(define-read-only (can-renew-verification (user principal))
+  (match (map-get? verification-timestamps { user: user })
+    timestamp-data
+      (let (
+        (verified-at (get verified-at timestamp-data))
+        (expiry-height (+ verified-at verification-validity-period))
+        (renewal-start (- expiry-height renewal-window))
+      )
+        (and 
+          (>= stacks-block-height renewal-start)
+          (<= stacks-block-height expiry-height)
+        )
+      )
     false
   )
 )
@@ -435,6 +486,56 @@
     (var-set total-verified (+ (var-get total-verified) u1))
     (unwrap-panic (update-reputation-score target (to-int base-reputation-score)))
     (unwrap-panic (update-reputation-score verifier (to-int (* vouch-reward u2))))
+    (ok true)
+  )
+)
+
+(define-public (renew-verification)
+  (let (
+    (user tx-sender)
+    (user-info (unwrap! (map-get? user-registrations { user: user }) err-not-found))
+    (renewal-fee (/ minimum-stake renewal-discount-rate))
+    (user-balance (stx-get-balance tx-sender))
+  )
+    (asserts! (not (var-get contract-paused)) (err u110))
+    (asserts! (is-eq (get verification-status user-info) "verified") err-not-verified)
+    (asserts! (can-renew-verification user) err-too-early-renewal)
+    (asserts! (>= user-balance renewal-fee) err-insufficient-stake)
+    
+    (try! (stx-transfer? renewal-fee tx-sender (as-contract tx-sender)))
+    
+    (map-set verification-timestamps
+      { user: user }
+      { verified-at: stacks-block-height }
+    )
+    
+    (unwrap-panic (update-reputation-score user (to-int vouch-reward)))
+    (ok true)
+  )
+)
+
+(define-public (extend-verification (target principal))
+  (let (
+    (extender tx-sender)
+    (extender-info (unwrap! (map-get? user-registrations { user: extender }) err-not-found))
+    (target-info (unwrap! (map-get? user-registrations { user: target }) err-not-found))
+    (extender-trust (calculate-trust-level extender))
+  )
+    (asserts! (not (var-get contract-paused)) (err u110))
+    (asserts! (is-eq (get verification-status extender-info) "verified") err-not-verified)
+    (asserts! (is-verification-valid extender) err-verification-expired)
+    (asserts! (is-eq (get verification-status target-info) "verified") err-not-verified)
+    (asserts! (is-eq extender-trust "high") err-insufficient-reputation)
+    (asserts! (not (is-eq extender target)) err-cannot-self-vouch)
+    (asserts! (not (is-verification-valid target)) err-already-exists)
+    
+    (map-set verification-timestamps
+      { user: target }
+      { verified-at: stacks-block-height }
+    )
+    
+    (unwrap-panic (update-reputation-score extender (to-int challenge-success-reward)))
+    (unwrap-panic (update-reputation-score target (to-int vouch-reward)))
     (ok true)
   )
 )
