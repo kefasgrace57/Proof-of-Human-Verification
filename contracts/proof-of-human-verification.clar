@@ -12,6 +12,8 @@
 (define-constant err-insufficient-reputation (err u112))
 (define-constant err-verification-expired (err u113))
 (define-constant err-too-early-renewal (err u114))
+(define-constant err-insufficient-treasury (err u115))
+(define-constant err-no-slashable-stake (err u116))
 
 (define-constant minimum-stake u1000000)
 (define-constant required-vouches u3)
@@ -24,10 +26,16 @@
 (define-constant verification-validity-period u8640)
 (define-constant renewal-window u1440)
 (define-constant renewal-discount-rate u2)
+(define-constant slash-percentage u50)
+(define-constant challenger-reward-percentage u30)
+(define-constant treasury-percentage u70)
 
 (define-data-var contract-paused bool false)
 (define-data-var total-verified uint u0)
 (define-data-var challenge-nonce uint u0)
+(define-data-var community-treasury uint u0)
+(define-data-var total-slashed uint u0)
+(define-data-var total-rewards-paid uint u0)
 
 (define-map user-registrations 
   { user: principal }
@@ -144,6 +152,18 @@
 
 (define-read-only (is-contract-paused)
   (var-get contract-paused)
+)
+
+(define-read-only (get-community-treasury)
+  (var-get community-treasury)
+)
+
+(define-read-only (get-slashing-stats)
+  {
+    total-slashed: (var-get total-slashed),
+    total-rewards-paid: (var-get total-rewards-paid),
+    treasury-balance: (var-get community-treasury)
+  }
 )
 
 (define-read-only (get-reputation-score (user principal))
@@ -537,5 +557,111 @@
     (unwrap-panic (update-reputation-score extender (to-int challenge-success-reward)))
     (unwrap-panic (update-reputation-score target (to-int vouch-reward)))
     (ok true)
+  )
+)
+
+(define-public (slash-and-revoke (target principal))
+  (let (
+    (slasher tx-sender)
+    (slasher-info (unwrap! (map-get? user-registrations { user: slasher }) err-not-found))
+    (target-info (unwrap! (map-get? user-registrations { user: target }) err-not-found))
+    (target-stake (get stake-amount target-info))
+    (slash-amount (/ (* target-stake slash-percentage) u100))
+    (challenger-reward (/ (* slash-amount challenger-reward-percentage) u100))
+    (treasury-amount (/ (* slash-amount treasury-percentage) u100))
+  )
+    (asserts! (not (var-get contract-paused)) (err u110))
+    (asserts! (is-eq (get verification-status slasher-info) "verified") err-not-verified)
+    (asserts! (is-verification-valid slasher) err-verification-expired)
+    (asserts! (is-eq (get verification-status target-info) "verified") err-not-verified)
+    (asserts! (not (is-eq slasher target)) err-cannot-self-vouch)
+    (asserts! (> target-stake u0) err-no-slashable-stake)
+    
+    (map-set user-registrations
+      { user: target }
+      (merge target-info 
+        { 
+          verification-status: "revoked",
+          stake-amount: (- target-stake slash-amount)
+        }
+      )
+    )
+    
+    (try! (as-contract (stx-transfer? challenger-reward tx-sender slasher)))
+    
+    (var-set community-treasury (+ (var-get community-treasury) treasury-amount))
+    (var-set total-slashed (+ (var-get total-slashed) slash-amount))
+    (var-set total-rewards-paid (+ (var-get total-rewards-paid) challenger-reward))
+    (var-set total-verified (- (var-get total-verified) u1))
+    
+    (unwrap-panic (update-reputation-score slasher (to-int challenge-success-reward)))
+    (unwrap-panic (update-reputation-score target (- 0 (to-int challenge-fail-penalty))))
+    (ok slash-amount)
+  )
+)
+
+(define-public (claim-treasury-reward (amount uint))
+  (let (
+    (claimer tx-sender)
+    (claimer-info (unwrap! (map-get? user-registrations { user: claimer }) err-not-found))
+    (claimer-reputation (get-reputation-score claimer))
+    (claimer-score (get current-score claimer-reputation))
+    (treasury-balance (var-get community-treasury))
+    (max-claimable (/ (* treasury-balance claimer-score) max-reputation-score))
+  )
+    (asserts! (not (var-get contract-paused)) (err u110))
+    (asserts! (is-eq (get verification-status claimer-info) "verified") err-not-verified)
+    (asserts! (is-verification-valid claimer) err-verification-expired)
+    (asserts! (<= amount max-claimable) err-insufficient-treasury)
+    (asserts! (<= amount treasury-balance) err-insufficient-treasury)
+    
+    (try! (as-contract (stx-transfer? amount tx-sender claimer)))
+    
+    (var-set community-treasury (- treasury-balance amount))
+    (var-set total-rewards-paid (+ (var-get total-rewards-paid) amount))
+    (ok amount)
+  )
+)
+
+(define-public (distribute-treasury-rewards (recipients (list 20 principal)))
+  (let (
+    (distributor tx-sender)
+    (treasury-balance (var-get community-treasury))
+    (per-recipient-amount (/ treasury-balance (len recipients)))
+  )
+    (asserts! (is-eq distributor contract-owner) err-owner-only)
+    (asserts! (not (var-get contract-paused)) (err u110))
+    (asserts! (> treasury-balance u0) err-insufficient-treasury)
+    (asserts! (> (len recipients) u0) err-not-found)
+    
+    (fold process-reward-distribution recipients (ok u0))
+  )
+)
+
+(define-private (process-reward-distribution (recipient principal) (previous-result (response uint uint)))
+  (let (
+    (treasury-balance (var-get community-treasury))
+    (reward-amount (/ treasury-balance u20))
+  )
+    (match previous-result
+      success
+        (match (map-get? user-registrations { user: recipient })
+          user-data
+            (if (and 
+                  (is-eq (get verification-status user-data) "verified")
+                  (is-verification-valid recipient)
+                  (> treasury-balance reward-amount))
+              (begin
+                (unwrap-panic (as-contract (stx-transfer? reward-amount tx-sender recipient)))
+                (var-set community-treasury (- treasury-balance reward-amount))
+                (var-set total-rewards-paid (+ (var-get total-rewards-paid) reward-amount))
+                (ok (+ success reward-amount))
+              )
+              (ok success)
+            )
+          (ok success)
+        )
+      error (err error)
+    )
   )
 )
