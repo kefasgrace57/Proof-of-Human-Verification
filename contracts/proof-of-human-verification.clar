@@ -93,6 +93,27 @@
         (is-verification-valid user)
       )
     false
+)
+)
+
+(define-map did-registry
+  { user: principal }
+  { did: (string-ascii 100) }
+)
+
+(define-read-only (get-did (user principal))
+  (map-get? did-registry { user: user })
+)
+
+(define-public (set-did (did (string-ascii 100)))
+  (let (
+    (user tx-sender)
+    (user-info (unwrap! (map-get? user-registrations { user: user }) err-not-found))
+  )
+    (asserts! (not (var-get contract-paused)) (err u110))
+    (asserts! (is-eq (get verification-status user-info) "verified") err-not-verified)
+    (map-set did-registry { user: user } { did: did })
+    (ok true)
   )
 )
 
