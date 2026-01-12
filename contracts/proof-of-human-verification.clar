@@ -14,6 +14,8 @@
 (define-constant err-too-early-renewal (err u114))
 (define-constant err-insufficient-treasury (err u115))
 (define-constant err-no-slashable-stake (err u116))
+(define-constant err-already-badged (err u117))
+(define-constant err-badge-not-found (err u118))
 
 (define-constant minimum-stake u1000000)
 (define-constant required-vouches u3)
@@ -36,6 +38,8 @@
 (define-data-var community-treasury uint u0)
 (define-data-var total-slashed uint u0)
 (define-data-var total-rewards-paid uint u0)
+(define-data-var badge-token-nonce uint u0)
+(define-data-var total-badges uint u0)
 
 (define-map user-registrations 
   { user: principal }
@@ -49,6 +53,66 @@
   }
 )
 
+(define-read-only (has-badge (user principal))
+  (is-some (map-get? badges-by-user { user: user }))
+)
+
+(define-read-only (get-badge-id (user principal))
+  (match (map-get? badges-by-user { user: user })
+    data (some (get token-id data))
+    none
+  )
+)
+
+(define-read-only (get-badge-owner (token-id uint))
+  (match (map-get? badge-owners { token-id: token-id })
+    data (some (get owner data))
+    none
+  )
+)
+
+(define-read-only (get-total-badges)
+  (var-get total-badges)
+)
+
+(define-public (mint-badge)
+  (let (
+    (user tx-sender)
+    (existing (map-get? badges-by-user { user: user }))
+    (token-id (var-get badge-token-nonce))
+  )
+    (asserts! (not (var-get contract-paused)) (err u110))
+    (asserts! (is-verified user) err-not-verified)
+    (asserts! (is-none existing) err-already-badged)
+    (map-set badges-by-user { user: user } { token-id: token-id })
+    (map-set badge-owners { token-id: token-id } { owner: user })
+    (var-set total-badges (+ (var-get total-badges) u1))
+    (var-set badge-token-nonce (+ token-id u1))
+    (ok token-id)
+  )
+)
+
+(define-public (burn-badge (target principal))
+  (let (
+    (caller tx-sender)
+    (record (map-get? badges-by-user { user: target }))
+  )
+    (asserts! (not (var-get contract-paused)) (err u110))
+    (asserts! (or (is-eq caller contract-owner) (is-eq caller target)) err-owner-only)
+    (match record
+      data
+        (let (
+          (token-id (get token-id data))
+        )
+          (map-delete badges-by-user { user: target })
+          (map-delete badge-owners { token-id: token-id })
+          (var-set total-badges (- (var-get total-badges) u1))
+          (ok token-id)
+        )
+      err-badge-not-found
+    )
+  )
+)
 (define-map vouches
   { voucher: principal, vouchee: principal }
   { vouch-height: uint }
@@ -79,6 +143,16 @@
     failed-challenges: uint,
     last-activity: uint
   }
+)
+
+(define-map badges-by-user
+  { user: principal }
+  { token-id: uint }
+)
+
+(define-map badge-owners
+  { token-id: uint }
+  { owner: principal }
 )
 
 (define-read-only (get-user-info (user principal))
